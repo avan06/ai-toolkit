@@ -2186,15 +2186,36 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 self.num_consecutive_oom += 1
                 if self.num_consecutive_oom > 3:
                     raise RuntimeError("OOM during training step 3 times in a row, aborting training")
-                optimizer.zero_grad(set_to_none=True)
-                flush()
-                torch.cuda.ipc_collect()
+                
+                # Added detailed OOM diagnostic information
                 # skip this step and keep going
                 print_acc("")
                 print_acc("################################################")
                 print_acc(f"# OOM during training step, skipping batch {self.num_consecutive_oom}/3 #")
+                try:
+                    # Display current VRAM status
+                    mem_alloc = torch.cuda.memory_allocated() / 1e9
+                    mem_reserved = torch.cuda.memory_reserved() / 1e9
+                    print_acc(f"# Step: {self.step_num}")
+                    print_acc(f"# VRAM State: {mem_alloc:.2f}GB (Allocated) / {mem_reserved:.2f}GB (Reserved)")
+                    
+                    # Display batch information causing OOM (resolution is key)
+                    if batch_list:
+                        for idx, b in enumerate(batch_list):
+                            if b and hasattr(b, 'file_items') and b.file_items:
+                                # List all dimensions for cases where batch size > 1
+                                dims = [f"{i.crop_width}x{i.crop_height}" for i in b.file_items]
+                                files = [os.path.basename(i.path) for i in b.file_items]
+                                print_acc(f"# Batch [{idx}]: Res={dims}")
+                                print_acc(f"# File: {files}")
+                except Exception as e:
+                    print_acc(f"# Failed to print debug info: {e}")
                 print_acc("################################################")
                 print_acc("")
+
+                optimizer.zero_grad(set_to_none=True)
+                flush()
+                torch.cuda.ipc_collect()
             else:
                 self.num_consecutive_oom = 0
             if self.torch_profiler is not None:
@@ -2248,15 +2269,23 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         self.accelerator.wait_for_everyone()
                         
                     if is_save_step:
-                        self.accelerator
                         # print above the progress bar
                         if self.progress_bar is not None:
                             self.progress_bar.pause()
                         print_acc(f"\nSaving at step {self.step_num}")
+    
+                        # Completely clear gradients before saving to release locked contiguous memory blocks
+                        optimizer.zero_grad(set_to_none=True)
+    
                         self.save(self.step_num)
                         self.ensure_params_requires_grad()
-                        # clear any grads
-                        optimizer.zero_grad()
+    
+                        # Completely clear again after saving (using set_to_none=True is crucial)
+                        optimizer.zero_grad(set_to_none=True)
+    
+                        # Force IPC collection and CUDA synchronization
+                        torch.cuda.ipc_collect()
+                        torch.cuda.synchronize()
                         flush()
                         flush_next = True
                         if self.progress_bar is not None:
