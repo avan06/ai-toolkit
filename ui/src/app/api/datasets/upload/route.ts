@@ -1,4 +1,4 @@
-// src/app/api/datasets/upload/route.ts
+﻿// src/app/api/datasets/upload/route.ts
 import { NextRequest, NextResponse } from 'next/server';
 import { writeFile, mkdir } from 'fs/promises';
 import { join } from 'path';
@@ -31,7 +31,8 @@ export async function POST(request: NextRequest) {
       const buffer = Buffer.from(bytes);
 
       // Clean filename and ensure it's unique
-      const fileName = file.name.replace(/[^a-zA-Z0-9.-]/g, '_');
+      // Only remove characters disallowed by the operating system (Windows/Linux)
+      const fileName = file.name.replace(/[<>:"/\\|?*]+/g, '_');
       const filePath = join(uploadDir, fileName);
 
       await writeFile(filePath, buffer);

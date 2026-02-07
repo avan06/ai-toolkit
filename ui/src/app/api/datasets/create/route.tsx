@@ -1,4 +1,4 @@
-import { NextResponse } from 'next/server';
+﻿import { NextResponse } from 'next/server';
 import fs from 'fs';
 import path from 'path';
 import { getDatasetsRoot } from '@/server/settings';
@@ -8,7 +8,9 @@ export async function POST(request: Request) {
     const body = await request.json();
     let { name } = body;
     // clean name by making lower case,  removing special characters, and replacing spaces with underscores
-    name = name.toLowerCase().replace(/[^a-z0-9]+/g, '_');
+    // Only remove characters disallowed by the operating system (Windows/Linux)
+    // Removed .toLowerCase() to preserve the original casing of the input
+    name = name.trim().replace(/[<>:"/\\|?*]+/g, '_');
 
     let datasetsPath = await getDatasetsRoot();
     let datasetPath = path.join(datasetsPath, name);

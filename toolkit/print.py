@@ -14,7 +14,11 @@ class Logger:
         self.log = log_file
 
     def write(self, message):
-        self.terminal.write(message)
+        try:
+            self.terminal.write(message)
+        except UnicodeEncodeError:
+            pass
+            
         self.log.write(message)
         self.log.flush()  # Make sure it's written immediately
 
