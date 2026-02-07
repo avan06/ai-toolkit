@@ -263,12 +263,22 @@ class _BouncingLinearFn(torch.autograd.Function):
         torch.cuda.current_stream().wait_event(ev_tx_b)
         ev_cu_b_start.record()
 
+        # Compute Gradient Input (Grad Input)
+        # This is one of the most memory-intensive steps in the backward pass
         # grad wrt input (GPU)
         grad_input = grad_out.to(dtype=target_dtype) @ w_bwd_buffers[idx]
+        
+        # Release GPU weights early
+        # After computing Grad Input, the weight matrix is no longer needed 
+        # (computing Grad Weight only requires Input and Grad Output).
+        # Set it to None immediately so the CUDA Allocator can reclaim this 
+        # huge memory block for the subsequent Grad Weight computation.
+        w_bwd_buffers[idx] = None 
 
         # ensure previous grad-to-CPU transfer that used this slot finished
         torch.cuda.current_stream().wait_event(ev_tx_w_bwd_done)
 
+        # Compute Gradient Weight (Grad Weight)
         # compute grads if float masters exist
         grad_weight = None
         grad_bias = None
@@ -276,6 +286,7 @@ class _BouncingLinearFn(torch.autograd.Function):
             getattr(weight_cpu, "requires_grad", False)
             and weight_cpu.dtype.is_floating_point
         ):
+            # Another massive matrix is generated here, taking advantage of the space just released above
             w_grad_buffers[idx] = grad_out.flatten(0, -2).T @ x.flatten(0, -2)
         if bias_cpu is not None and getattr(bias_cpu, "requires_grad", False):
             reduce_dims = tuple(range(grad_out.ndim - 1))
@@ -473,6 +484,7 @@ class _BouncingConv2dFn(torch.autograd.Function):
 
         from torch.nn.grad import conv2d_input, conv2d_weight  # type: ignore
 
+        # Compute gradient input
         grad_input = conv2d_input(
             x.shape,
             w_bwd_buffers[idx],
@@ -483,9 +495,13 @@ class _BouncingConv2dFn(torch.autograd.Function):
             groups=groups,
         )
 
+        # Release GPU weights early
+        w_bwd_buffers[idx] = None
+
         # Ensure previous grad transfer that used this slot is done
         torch.cuda.current_stream().wait_event(ev_tx_w_bwd_done)
 
+        # Compute gradient weight
         # Compute heavy grads on GPU into staging buffers
         grad_weight = None
         grad_bias = None
