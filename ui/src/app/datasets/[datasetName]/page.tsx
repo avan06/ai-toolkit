@@ -1,4 +1,4 @@
-'use client';
+﻿'use client';
 
 import { useEffect, useState, use, useMemo } from 'react';
 import { LuImageOff, LuLoader, LuBan } from 'react-icons/lu';
@@ -16,7 +16,8 @@ export default function DatasetPage({ params }: { params: { datasetName: string 
   const [imgList, setImgList] = useState<{ img_path: string }[]>([]);
   const [isAutoCaptioning, setIsAutoCaptioning] = useState(false);
   const usableParams = use(params as any) as { datasetName: string };
-  const datasetName = usableParams.datasetName;
+  // Use decodeURIComponent to handle encoding issues in non-ASCII paths
+  const datasetName = decodeURIComponent(usableParams.datasetName);
   const [status, setStatus] = useState<'idle' | 'loading' | 'success' | 'error'>('idle');
   const { settings, isSettingsLoaded } = useSettings();
 
