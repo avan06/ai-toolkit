@@ -30,6 +30,18 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
   const [savedCaption, setSavedCaption] = useState<string>('');
   const isGettingCaption = useRef<boolean>(false);
 
+  // Use Ref to track the latest caption state, making it accessible during component unmounting
+  const captionRef = useRef(caption);
+  const savedCaptionRef = useRef(savedCaption);
+
+  useEffect(() => {
+    captionRef.current = caption;
+  }, [caption]);
+
+  useEffect(() => {
+    savedCaptionRef.current = savedCaption;
+  }, [savedCaption]);
+
   const fetchCaption = async () => {
     if (isGettingCaption.current || isCaptionLoaded) return;
     isGettingCaption.current = true;
@@ -54,20 +66,42 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
       });
   };
 
+  // Modify saveCaption to use fetch + keepalive: true
+  // This ensures the browser completes the request in the background even during page navigation
   const saveCaption = () => {
-    const trimmedCaption = caption.trim();
-    if (trimmedCaption === savedCaption) return;
-    apiClient
-      .post('/api/img/caption', { imgPath: imageUrl, caption: trimmedCaption })
-      .then(res => res.data)
-      .then(data => {
-        console.log('Caption saved:', data);
-        setSavedCaption(trimmedCaption);
-      })
-      .catch(error => {
-        console.error('Error saving caption:', error);
-      });
+    const currentCaption = captionRef.current.trim();
+    const lastSaved = savedCaptionRef.current;
+
+    if (currentCaption === lastSaved) return;
+
+    // Update savedCaptionRef to prevent duplicate submissions (optimistic update)
+    savedCaptionRef.current = currentCaption;
+    setSavedCaption(currentCaption);
+
+    // Use native fetch to support keepalive
+    fetch('/api/img/caption', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ imgPath: imageUrl, caption: currentCaption }),
+      keepalive: true, // allows the request to survive after the page is unmounted
+    })
+    .then(res => res.json())
+    .then(data => {
+      console.log('Caption saved:', data);
+    })
+    .catch(error => {
+      console.error('Error saving caption:', error);
+    });
   };
+
+  // force a check and save when the component unmounts (e.g., leaving the page)
+  useEffect(() => {
+    return () => {
+      saveCaption();
+    };
+  }, []);
 
   // Only fetch caption when the component is both in viewport and visible
   useEffect(() => {
