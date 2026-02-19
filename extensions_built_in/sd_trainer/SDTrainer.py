@@ -1543,6 +1543,58 @@ class SDTrainer(BaseSDTrainProcess):
                                 conditional_embeds = batch.prompt_embeds.clone().detach().to(
                                     self.device_torch, dtype=dtype
                                 )
+
+                                # Manually inject Caption Dropout
+                                # Determine which indices to drop before doing any heavy GPU work
+                                indices_to_drop = []
+                                # Iterate through the current batch and decide whether to replace based on the dropout rate
+                                for idx, file_item in enumerate(batch.file_items):
+                                    # Get the caption dropout rate from the dataset config for this image
+                                    rate = file_item.dataset_config.caption_dropout_rate
+                                    if not file_item.is_reg and rate > 0 and random.random() < rate:
+                                        indices_to_drop.append(idx)
+
+                                # Only run if at least one image needs dropout
+                                if len(indices_to_drop) > 0:
+                                    # Get the cached blank embedding (calculated during SDTrainer initialization and stored in self.cached_blank_embeds)
+                                    blank_emb = self.cached_blank_embeds.clone().to(self.device_torch, dtype=dtype)
+                                    
+                                    target_l = conditional_embeds.text_embeds.shape[1] # Actual batch tensor width
+                                    source_l = blank_emb.text_embeds.shape[1]         # Blank template width
+                                    
+                                    # Use the first token of the blank embedding as filler (usually BOS or padding token)
+                                    padding_token = blank_emb.text_embeds[0, 0, :] 
+
+                                    # Create a full-width text tensor to match current batch [target_l, Hidden_Dim]
+                                    final_blank_text = padding_token.repeat(target_l, 1)
+                                    # Copy original blank signal into the beginning
+                                    copy_l = min(target_l, source_l)
+                                    final_blank_text[:copy_l, :] = blank_emb.text_embeds[0, :copy_l, :]
+
+                                    # The mask MUST be ones for the entire target_l width.
+                                    # This forces the model to generate enough RoPE frequencies [target_l] 
+                                    # to match the Query tensor size, avoiding size mismatch errors.
+                                    final_blank_mask = None
+                                    if conditional_embeds.attention_mask is not None:
+                                        final_blank_mask = torch.ones((target_l,), device=self.device_torch, dtype=conditional_embeds.attention_mask.dtype)
+                                    
+                                    blank_pool_src = blank_emb.pooled_embeds[0] if blank_emb.pooled_embeds is not None else None
+
+                                    # Apply replacement to identified indices
+                                    for idx in indices_to_drop:
+                                        # Replace Text Embeds
+                                        conditional_embeds.text_embeds[idx] = final_blank_text
+
+                                        # Replace Pooled Embeds (for SDXL/Flux)
+                                        if blank_pool_src is not None and conditional_embeds.pooled_embeds is not None:
+                                            conditional_embeds.pooled_embeds[idx] = blank_pool_src
+
+                                        # Replace Attention Mask (for Qwen/Flux/T5)
+                                        if final_blank_mask is not None:
+                                            conditional_embeds.attention_mask[idx] = final_blank_mask
+                                            
+                                    # Log the action
+                                    print_acc(f" - Caption Dropout applied: {len(indices_to_drop)}/{len(batch.file_items)} images (Length adapted to {target_l})")
                             else:
                                 embeds_to_use = self.cached_blank_embeds.clone().detach().to(
                                     self.device_torch, dtype=dtype
