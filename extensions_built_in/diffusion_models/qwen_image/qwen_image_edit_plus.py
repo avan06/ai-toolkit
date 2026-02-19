@@ -176,8 +176,9 @@ class QwenImageEditPlusModel(QwenImageModel):
             for i in range(len(control_images)):
                 # control images are 0 - 1 scale, shape (bs, ch, height, width)
                 ratio = control_images[i].shape[2] / control_images[i].shape[3]
-                width = math.sqrt(CONDITION_IMAGE_SIZE * ratio)
-                height = width / ratio
+                # Area = w*h, h = w*ratio => Area = w^2 * ratio => w = sqrt(Area/ratio)
+                width = math.sqrt(CONDITION_IMAGE_SIZE / ratio) 
+                height = width * ratio
 
                 width = round(width / 32) * 32
                 height = round(height / 32) * 32
