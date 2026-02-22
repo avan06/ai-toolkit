@@ -238,85 +238,111 @@ class QwenImageEditPlusModel(QwenImageModel):
             packed_latents_list = torch.chunk(latent_model_input, batch_size, dim=0)
             packed_latents_with_controls_list = []
             
-            batch_control_tensor_list = batch.control_tensor_list
-            if batch_control_tensor_list is None and batch.control_tensor is not None:
-                batch_control_tensor_list = []
+            # Check for cached control_latents
+            if batch is not None and getattr(batch, 'control_latents', None) is not None:
+                # Retrieve pre-cached latents directly from the Batch
+                cached_latents = batch.control_latents.to(self.device_torch, dtype=self.torch_dtype)
+                if cached_latents.ndim == 4:
+                    cached_latents = cached_latents.unsqueeze(1) # Transform to [B, N, C, H, W]
+                    
                 for b in range(batch_size):
-                    batch_control_tensor_list.append(batch.control_tensor[b : b + 1])
+                    item_control_patches = []
+                    for n in range(cached_latents.shape[1]):
+                        c_lat = cached_latents[b, n] # [C, H, W]
+                        c_height, c_width = c_lat.shape[1], c_lat.shape[2]
+                        
+                        # Packing logic
+                        # Qwen uses patch_size=2, so dimensions are divided by 2 during the view operation
+                        control_patch = c_lat.view(1, num_channels_latents, c_height // 2, 2, c_width // 2, 2)
+                        control_patch = control_patch.permute(0, 2, 4, 1, 3, 5).reshape(1, (c_height // 2) * (c_width // 2), -1)
+            
+                        item_control_patches.append(control_patch)
+                        # Synchronously update positional encoding shapes
+                        img_shapes[b].append((1, c_height // 2, c_width // 2)) 
+            
+                    control_concat = torch.cat(item_control_patches, dim=1)
+                    combined = torch.cat([packed_latents_list[b], control_concat], dim=1)
+                    packed_latents_with_controls_list.append(combined)
+            else:
+                batch_control_tensor_list = batch.control_tensor_list
+                if batch_control_tensor_list is None and batch.control_tensor is not None:
+                    batch_control_tensor_list = []
+                    for b in range(batch_size):
+                        batch_control_tensor_list.append(batch.control_tensor[b : b + 1])
 
-            if batch_control_tensor_list is not None:
-                b = 0
-                for control_tensor_list in batch_control_tensor_list:
-                    # control tensor list is a list of tensors for this batch item
-                    controls = []
-                    # pack control
-                    for control_img in control_tensor_list:
-                        # control images are 0 - 1 scale, shape (1, ch, height, width)
-                        control_img = control_img.to(
-                            self.device_torch, dtype=self.torch_dtype
+                if batch_control_tensor_list is not None:
+                    b = 0
+                    for control_tensor_list in batch_control_tensor_list:
+                        # control tensor list is a list of tensors for this batch item
+                        controls = []
+                        # pack control
+                        for control_img in control_tensor_list:
+                            # control images are 0 - 1 scale, shape (1, ch, height, width)
+                            control_img = control_img.to(
+                                self.device_torch, dtype=self.torch_dtype
+                            )
+                            # if it is only 3 dim, add batch dim
+                            if len(control_img.shape) == 3:
+                                control_img = control_img.unsqueeze(0)
+                            ratio = control_img.shape[2] / control_img.shape[3] # ratio = H / W
+                            c_width = math.sqrt(control_image_res / ratio)     # Divide by ratio to obtain width
+                            c_height = c_width * ratio                         # Multiply by ratio to obtain height
+
+                            c_width = round(c_width / 32) * 32
+                            c_height = round(c_height / 32) * 32
+
+                            control_img = F.interpolate(
+                                control_img, size=(c_height, c_width), mode="bilinear"
+                            )
+
+                            # scale to -1 to 1
+                            control_img = control_img * 2 - 1
+
+                            control_latent = self.encode_images(
+                                control_img,
+                                device=self.device_torch,
+                                dtype=self.torch_dtype,
+                            )
+
+                            clb, cl_num_channels_latents, cl_height, cl_width = (
+                                control_latent.shape
+                            )
+
+                            control = control_latent.view(
+                                1,
+                                cl_num_channels_latents,
+                                cl_height // 2,
+                                2,
+                                cl_width // 2,
+                                2,
+                            )
+                            control = control.permute(0, 2, 4, 1, 3, 5)
+                            control = control.reshape(
+                                1,
+                                (cl_height // 2) * (cl_width // 2),
+                                num_channels_latents * 4,
+                            )
+
+                            img_shapes[b].append((1, cl_height // 2, cl_width // 2))
+                            controls.append(control)
+
+                        # stack controls on dim 1
+                        control = torch.cat(controls, dim=1).to(
+                            packed_latents_list[b].device,
+                            dtype=packed_latents_list[b].dtype,
                         )
-                        # if it is only 3 dim, add batch dim
-                        if len(control_img.shape) == 3:
-                            control_img = control_img.unsqueeze(0)
-                        ratio = control_img.shape[2] / control_img.shape[3]
-                        c_width = math.sqrt(control_image_res * ratio)
-                        c_height = c_width / ratio
-
-                        c_width = round(c_width / 32) * 32
-                        c_height = round(c_height / 32) * 32
-
-                        control_img = F.interpolate(
-                            control_img, size=(c_height, c_width), mode="bilinear"
+                        # concat with latents
+                        packed_latents_with_control = torch.cat(
+                            [packed_latents_list[b], control], dim=1
                         )
 
-                        # scale to -1 to 1
-                        control_img = control_img * 2 - 1
-
-                        control_latent = self.encode_images(
-                            control_img,
-                            device=self.device_torch,
-                            dtype=self.torch_dtype,
+                        packed_latents_with_controls_list.append(
+                            packed_latents_with_control
                         )
 
-                        clb, cl_num_channels_latents, cl_height, cl_width = (
-                            control_latent.shape
-                        )
+                        b += 1
 
-                        control = control_latent.view(
-                            1,
-                            cl_num_channels_latents,
-                            cl_height // 2,
-                            2,
-                            cl_width // 2,
-                            2,
-                        )
-                        control = control.permute(0, 2, 4, 1, 3, 5)
-                        control = control.reshape(
-                            1,
-                            (cl_height // 2) * (cl_width // 2),
-                            num_channels_latents * 4,
-                        )
-
-                        img_shapes[b].append((1, cl_height // 2, cl_width // 2))
-                        controls.append(control)
-
-                    # stack controls on dim 1
-                    control = torch.cat(controls, dim=1).to(
-                        packed_latents_list[b].device,
-                        dtype=packed_latents_list[b].dtype,
-                    )
-                    # concat with latents
-                    packed_latents_with_control = torch.cat(
-                        [packed_latents_list[b], control], dim=1
-                    )
-
-                    packed_latents_with_controls_list.append(
-                        packed_latents_with_control
-                    )
-
-                    b += 1
-
-                latent_model_input = torch.cat(packed_latents_with_controls_list, dim=0)
+            latent_model_input = torch.cat(packed_latents_with_controls_list, dim=0)
 
             prompt_embeds_mask = text_embeddings.attention_mask.to(
                 self.device_torch, dtype=torch.int64
@@ -340,6 +366,11 @@ class QwenImageEditPlusModel(QwenImageModel):
             return_dict=False,
             **kwargs,
         )[0]
+
+        # Immediately release input tensors
+        del latent_model_input
+        del enc_hs
+        del prompt_embeds_mask
 
         noise_pred = noise_pred[:, : raw_packed_latents.size(1)]
 

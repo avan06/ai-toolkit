@@ -205,11 +205,25 @@ class DataLoaderBatchDTO:
                 )
             # if we have encoded latents, we concatenate them
             self.latents: Union[torch.Tensor, None] = None
+            self.control_latents: Union[torch.Tensor, None] = None
             if is_latents_cached:
                 # this get_latent call with trigger loading all cached items from the disk
                 self.latents = torch.cat(
                     [x.get_latent().unsqueeze(0) for x in self.file_items]
                 )
+                # Assemble the control image latent batch
+                if any([x._cached_control_latent is not None for x in self.file_items]):
+                    c_latents_list = []
+                    for x in self.file_items:
+                        cl = x._cached_control_latent
+                        # If stored as 3D [C, H, W], expand to 4D [1, C, H, W]
+                        if cl.ndim == 3:
+                            cl = cl.unsqueeze(0)
+                        # If it's already 4D [N, C, H, W], leave it as is
+                        c_latents_list.append(cl)
+    
+                    # For batch size 1 with N=3, the result will be [1, 3, 4, h, w]
+                    self.control_latents = torch.stack(c_latents_list, dim=0)
                 if any(
                     [x._cached_first_frame_latent is not None for x in self.file_items]
                 ):

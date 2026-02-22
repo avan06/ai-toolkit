@@ -15,6 +15,7 @@ import torch
 from safetensors.torch import load_file, save_file
 from tqdm import tqdm
 from transformers import CLIPImageProcessor, CLIPVisionModelWithProjection, SiglipImageProcessor
+import torch.nn.functional as F
 
 from toolkit.audio.preserve_pitch import time_stretch_preserve_pitch
 from toolkit.basic import flush, value_map
@@ -1716,13 +1717,26 @@ class LatentCachingFileItemDTOMixin:
         self._encoded_latent: Union[torch.Tensor, None] = None
         self._cached_first_frame_latent: Union[torch.Tensor, None] = None
         self._cached_audio_latent: Union[torch.Tensor, None] = None
+        self._cached_control_latent: Union[torch.Tensor, None] = None 
         self._latent_path: Union[str, None] = None
+        self._control_latent_path: Union[str, List[str], None] = None 
         self.is_latent_cached = False
         self.is_caching_to_disk = False
         self.is_caching_to_memory = False
         self.latent_load_device = 'cpu'
         # todo, increment this if we change the latent format to invalidate cache
         self.latent_version = 1
+        
+        sd = kwargs.get('sd', None)
+        # Store VAE scale factor; prioritize retrieving from the model, defaults to 8 if unavailable
+        self.vae_scale_factor = 8
+        if sd and hasattr(sd, "pipeline") and hasattr(sd.pipeline, "vae_scale_factor"):
+            self.vae_scale_factor = sd.pipeline.vae_scale_factor
+        
+        # Store match_target_res setting; determines whether to match the target image resolution
+        self.match_target_res = False
+        if sd and hasattr(sd, 'model_config'):
+            self.match_target_res = sd.model_config.model_kwargs.get("match_target_res", False)
 
     def get_latent_info_dict(self: 'FileItemDTO'):
         item = OrderedDict([
@@ -1770,6 +1784,62 @@ class LatentCachingFileItemDTOMixin:
 
         return self._latent_path
 
+    def _generate_control_cache_path(self: 'FileItemDTO', c_path: str):
+        """Internal method: Calculate the hash and cache path for control image."""
+        img_dir = os.path.dirname(c_path)
+        cache_dir = os.path.join(img_dir, '_control_latent_cache')
+        
+        vae_scale_factor = self.vae_scale_factor
+        match_target_res = self.match_target_res
+
+        # Original dimensions are required here. Use FileItemDTO data if available;
+        # otherwise, use the target area as the hashing core (since control images are typically not cropped).
+        if match_target_res:
+            # Case A: Target area matches the main image bucket
+            target_area_px = self.crop_width * self.crop_height
+        else:
+            # Case B: Fixed 1MP area
+            VAE_IMAGE_SIZE = 1024 * 1024
+            target_area_px = VAE_IMAGE_SIZE
+
+        # Metadata hashing logic
+        item = OrderedDict([
+            ("filename", os.path.basename(c_path)),
+            ("target_area_px", target_area_px),
+            ("vae_scale_factor", vae_scale_factor),
+            ("latent_space_version", self.latent_space_version),
+            ("latent_version", self.latent_version),
+            ("is_control", True),
+        ])
+        if self.flip_x:
+            item["flip_x"] = True
+        if self.flip_y:
+            item["flip_y"] = True
+        
+        filename_no_ext = os.path.splitext(os.path.basename(c_path))[0]
+        hash_input = json.dumps(item, sort_keys=True).encode('utf-8')
+        hash_str = base64.urlsafe_b64encode(hashlib.md5(hash_input).digest()).decode('ascii').replace('=', '')
+        
+        return os.path.join(cache_dir, f'{filename_no_ext}_{hash_str}.safetensors'), item
+
+    def get_control_cache_path(self: 'FileItemDTO', recalculate=False) -> Union[str, List[str], None]:
+        """Retrieve control_path from FileItemDTO and return the corresponding cache path(s)."""
+        if self._control_latent_path is not None and not recalculate:
+            return self._control_latent_path
+
+        if not self.has_control_image or self.control_path is None:
+            self._control_latent_path = None
+            return None
+            
+        if isinstance(self.control_path, list):
+            # Return a list if in multi-image mode
+            self._control_latent_path = [self._generate_control_cache_path(p)[0] for p in self.control_path]
+        else:
+            # Return a string if in single-image mode
+            self._control_latent_path = self._generate_control_cache_path(self.control_path)[0]
+
+        return self._control_latent_path
+
     def cleanup_latent(self):
         if self._encoded_latent is not None:
             if not self.is_caching_to_memory:
@@ -1777,6 +1847,7 @@ class LatentCachingFileItemDTOMixin:
                 self._encoded_latent = None
                 self._cached_first_frame_latent = None
                 self._cached_audio_latent = None
+                self._cached_control_latent = None 
             else:
                 # move it back to cpu
                 self._encoded_latent = self._encoded_latent.to('cpu')
@@ -1784,6 +1855,8 @@ class LatentCachingFileItemDTOMixin:
                     self._cached_first_frame_latent = self._cached_first_frame_latent.to('cpu')
                 if self._cached_audio_latent is not None:
                     self._cached_audio_latent = self._cached_audio_latent.to('cpu')
+                if self._cached_control_latent is not None:
+                    self._cached_control_latent = self._cached_control_latent.to('cpu')
 
     def get_latent(self, device=None):
         if not self.is_latent_cached:
@@ -1800,6 +1873,34 @@ class LatentCachingFileItemDTOMixin:
                 self._cached_first_frame_latent = state_dict['first_frame_latent']
             if 'audio_latent' in state_dict:
                 self._cached_audio_latent = state_dict['audio_latent']
+            
+        # Load control image latents (from the independent control dataset path)
+        if self.has_control_image and self._cached_control_latent is None:
+            # When calling get_control_cache_path(), it automatically retrieves 
+            # the current object's self.crop_width / height to calculate the correct hash.
+            c_paths = self.get_control_cache_path()
+            
+            if c_paths is not None:
+                # Convert to a list to unify processing, whether it is a single string or a list of paths
+                path_list = c_paths if isinstance(c_paths, list) else [c_paths]
+                
+                c_latents = []
+                for p in path_list:
+                    # Locate the corresponding file based on the correct resolution hash
+                    if os.path.exists(p):
+                        c_state = load_file(p, device='cpu')
+                        if 'control_latent' in c_state:
+                            c_latents.append(c_state['control_latent'])
+                
+                # Store back into the DTO memory based on the number of latents loaded
+                if c_latents:
+                    if len(c_latents) == 1:
+                        # Single-image mode: stored as [C, H, W]
+                        self._cached_control_latent = c_latents[0]
+                    else:
+                        # Multi-image mode: stacked as [N, C, H, W]
+                        self._cached_control_latent = torch.stack(c_latents)
+
         return self._encoded_latent
 
 
@@ -1823,6 +1924,15 @@ class LatentCachingMixin:
                 print_acc(" - Keeping latents in memory")
             # move sd items to cpu except for vae
             self.sd.set_device_state_preset('cache_latents')
+            dtype = self.sd.torch_dtype
+            device = self.sd.device_torch
+
+            # Determine whether to match the target resolution of the main image
+            model_kwargs = self.sd.model_config.model_kwargs
+            match_target_res = model_kwargs.get("match_target_res", False)
+        
+            # Default 1MP (1-megapixel) area, derived from the VAE_IMAGE_SIZE logic
+            DEFAULT_TARGET_AREA = 1024 * 1024
 
             # use tqdm to show progress
             i = 0
@@ -1837,17 +1947,15 @@ class LatentCachingMixin:
                     if to_memory:
                         # load it into memory
                         state_dict = load_file(latent_path, device='cpu')
-                        file_item._encoded_latent = state_dict['latent'].to('cpu', dtype=self.sd.torch_dtype)
+                        file_item._encoded_latent = state_dict['latent'].to('cpu', dtype=dtype)
                         if 'first_frame_latent' in state_dict:
-                            file_item._cached_first_frame_latent = state_dict['first_frame_latent'].to('cpu', dtype=self.sd.torch_dtype)
+                            file_item._cached_first_frame_latent = state_dict['first_frame_latent'].to('cpu', dtype=dtype)
                         if 'audio_latent' in state_dict:
-                            file_item._cached_audio_latent = state_dict['audio_latent'].to('cpu', dtype=self.sd.torch_dtype)
+                            file_item._cached_audio_latent = state_dict['audio_latent'].to('cpu', dtype=dtype)
                 else:
                     # not saved to disk, calculate
                     # load the image first
                     file_item.load_and_process_image(self.transform, only_load_latents=True)
-                    dtype = self.sd.torch_dtype
-                    device = self.sd.device_torch
                     state_dict = OrderedDict()
                     first_frame_latent = None
                     audio_latent = None
@@ -1889,16 +1997,130 @@ class LatentCachingMixin:
 
                     if to_memory:
                         # keep it in memory
-                        file_item._encoded_latent = latent.to('cpu', dtype=self.sd.torch_dtype)
+                        file_item._encoded_latent = latent.to('cpu', dtype=dtype)
                         if first_frame_latent is not None:
-                            file_item._cached_first_frame_latent = first_frame_latent.to('cpu', dtype=self.sd.torch_dtype)
+                            file_item._cached_first_frame_latent = first_frame_latent.to('cpu', dtype=dtype)
                         if audio_latent is not None:
-                            file_item._cached_audio_latent = audio_latent.to('cpu', dtype=self.sd.torch_dtype)
+                            file_item._cached_audio_latent = audio_latent.to('cpu', dtype=dtype)
 
                     del imgs
                     del latent
                     del file_item.tensor
-                    file_item.cleanup()
+
+                # Process control image latents
+                if file_item.has_control_image:
+                    # Retrieve the cache path list and source image path list directly from the DTO
+                    c_cache_paths = file_item.get_control_cache_path()
+                    c_src_paths = file_item.control_path
+                    
+                    # Unify into a list for easier processing
+                    if isinstance(c_cache_paths, str):
+                        c_cache_paths = [c_cache_paths]
+                        c_src_paths = [c_src_paths]
+                    
+                    # Check: Does at least one cache file not exist?
+                    needs_encoding = any(not os.path.exists(p) for p in c_cache_paths)
+                    # If encoding is required, load the original image "only once" before entering the loop
+                    if needs_encoding:
+                        file_item.load_control_image()
+
+                    c_latents_list = []
+                    # Check if images were successfully loaded
+                    has_source_tensors = file_item.control_tensor is not None or file_item.control_tensor_list is not None
+
+                    for i, c_cache_path in enumerate(c_cache_paths):
+                        if os.path.exists(c_cache_path):
+                            # Cache exists; read it directly
+                            c_state = load_file(c_cache_path, device='cpu')
+                            c_latent = c_state['control_latent'].to('cpu', dtype=dtype)
+                        elif needs_encoding and has_source_tensors:
+                            # Load and encode original image only if cache is missing
+                            # Cache missing and source image is ready; perform VAE encoding
+                            # Retrieve the corresponding tensor
+                            if file_item.control_tensor_list is not None:
+                                c_img_raw = file_item.control_tensor_list[i]
+                            elif file_item.control_tensor.ndim == 4: # Multi-image stacked [N, C, H, W]
+                                c_img_raw = file_item.control_tensor[i]
+                            else: # Single image [C, H, W]
+                                c_img_raw = file_item.control_tensor
+                                
+                            # Ensure c_img_raw is 4D to meet VAE requirements [1, C, H, W]
+                            if c_img_raw.ndim == 3:
+                                c_img_raw = c_img_raw.unsqueeze(0)
+                            elif c_img_raw.ndim == 4 and c_img_raw.shape[0] != 1:
+                                # If multiple images are stacked, take only the current one (as a safety measure)
+                                c_img_raw = c_img_raw[0:1]
+
+                                
+                            # Calculate target dimensions in pixel space (take last two dims regardless of 3D or 4D)
+                            cur_h, cur_w = c_img_raw.shape[-2:]
+                            ratio = cur_h / cur_w
+                            
+                            if match_target_res:
+                                # Area matches the main image bucket
+                                target_area_px = file_item.crop_width * file_item.crop_height
+                            else:
+                                target_area_px = DEFAULT_TARGET_AREA
+                                
+                            # Calculate target pixel width and height
+                            target_px_w = math.sqrt(target_area_px / ratio)
+                            target_px_h = target_px_w * ratio
+
+                            # Align to 32 pixels according to Qwen specifications
+                            target_px_w = max(32, round(target_px_w / 32) * 32)
+                            target_px_h = max(32, round(target_px_h / 32) * 32)
+
+                            # Perform scaling in pixel space
+                            c_img_processed = c_img_raw.to(device, dtype=torch.float32)
+
+                            # Force conversion to 4D (N, C, H, W)
+                            if c_img_processed.ndim == 3:
+                                c_img_processed = c_img_processed.unsqueeze(0)
+                            elif c_img_processed.ndim == 5:
+                                c_img_processed = c_img_processed.squeeze(0) # In case it accidentally became 5D
+                                
+                            # Ensure shape is [1, 3, H, W] (handling cases where image might be RGBA [1, 4, H, W])
+                            if c_img_processed.shape[1] > 3:
+                                c_img_processed = c_img_processed[:, :3, :, :]
+
+                            if cur_h != target_px_h or cur_w != target_px_w:
+                                c_img_processed = F.interpolate(
+                                    c_img_processed,
+                                    size=(target_px_h, target_px_w),
+                                    mode="bicubic", # Use bicubic for pixel scaling
+                                    align_corners=False
+                                )
+                                
+                            # Normalize and perform VAE encoding
+                            c_img_processed = (c_img_processed * 2.0 - 1.0).to(dtype=dtype)
+                            c_latent = self.sd.encode_images(c_img_processed) # Output is at the correct size, [1, C, H, W]
+                            
+                            # Ensure conversion back to 3D [C, H, W] before saving
+                            if c_latent.ndim == 4 and c_latent.shape[0] == 1:
+                                c_latent = c_latent.squeeze(0)
+                            elif c_latent.ndim == 4:
+                                # If shape[0] is not 1, multiple images might have been encoded; take the first one
+                                c_latent = c_latent[0]
+
+                            c_latent = c_latent.cpu()
+                            
+                            if to_disk:
+                                os.makedirs(os.path.dirname(c_cache_path), exist_ok=True)
+                                _, meta_dict = file_item._generate_control_cache_path(c_src_paths[i])
+                                save_file({'control_latent': c_latent}, c_cache_path, 
+                                          metadata=get_meta_for_safetensors(meta_dict))
+                            del c_img_raw, c_img_processed
+                        
+                        c_latents_list.append(c_latent.clone().detach().cpu())
+                        del c_latent
+                    
+                    if to_memory:
+                        # Store in memory for training use
+                        if len(c_latents_list) > 0:
+                            file_item._cached_control_latent = c_latents_list[0] if len(c_latents_list) == 1 else torch.stack(c_latents_list)
+                    file_item.cleanup_control()
+
+                file_item.cleanup()
 
                 file_item.is_latent_cached = True
                 i += 1
