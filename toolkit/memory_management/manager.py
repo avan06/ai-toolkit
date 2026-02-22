@@ -89,58 +89,55 @@ class MemoryManager:
             
         # count ignore modules as processed
         modules_processed = [x for x in ignore_modules]
+
+        # Scan the model and calculate the total number of target layers
+        total_target_layers = 0
+        for name, sub_module in module.named_modules():
+            for child_name, child_module in sub_module.named_modules():
+                if child_module in modules_processed:
+                    continue
+                if child_module.__class__.__name__ in LINEAR_MODULES or child_module.__class__.__name__ in CONV_MODULES:
+                    total_target_layers += 1
+
+        # Calculate how many layers are "privileged" to be kept on the GPU
+        # e.g., for 100 layers and offload_percent=0.85, keep_on_gpu_count = 15
+        keep_on_gpu_count = int(total_target_layers * (1.0 - offload_percent))
+        current_layer_idx = 0
+
+        # Sequential allocation (prioritize keeping the initial layers)
         # attach to all modules
         for name, sub_module in module.named_modules():
             for child_name, child_module in sub_module.named_modules():
-                if (
-                    child_module.__class__.__name__ in LINEAR_MODULES
-                    and child_module not in modules_processed
-                ):
-                    skip = False
-                    if offload_percent < 1.0:
-                        # randomly skip some modules
-                        if random.random() > offload_percent:
-                            skip = True
+                if child_module in modules_processed:
+                    continue
+                
+                is_linear = child_module.__class__.__name__ in LINEAR_MODULES
+                is_conv = child_module.__class__.__name__ in CONV_MODULES
+
+                if is_linear or is_conv:
+                    # Determine whether to stay on the GPU
+                    skip = False 
+                    if current_layer_idx < keep_on_gpu_count:
+                        skip = True  # Do not apply offloading (keep on GPU) if within the quota
+                    
+                    current_layer_idx += 1
+
                     if skip:
                         module._memory_manager.unmanaged_modules.append(child_module)
                     else:
-                        # linear
-                        LinearLayerMemoryManager.attach(
-                            child_module, module._memory_manager
-                        )
-                        # attach to ARA as well
+                        if is_linear:
+                            LinearLayerMemoryManager.attach(child_module, module._memory_manager)
+                        elif is_conv:
+                            ConvLayerMemoryManager.attach(child_module, module._memory_manager)
+                        
+                        # attach to ARA (Accuracy Recovery Adapter) as well
                         if hasattr(child_module, "ara_lora_ref"):
                             ara = child_module.ara_lora_ref()
                             if ara not in modules_processed:
                                 MemoryManager.attach(
-                                    ara, 
+                                    ara,
                                     device,
-                                )
-                    modules_processed.append(child_module)
-                elif (
-                    child_module.__class__.__name__ in CONV_MODULES
-                    and child_module not in modules_processed
-                ):
-                    skip = False
-                    if offload_percent < 1.0:
-                        # randomly skip some modules
-                        if random.random() > offload_percent:
-                            skip = True
-                    if skip:
-                        module._memory_manager.unmanaged_modules.append(child_module)
-                    else:
-                        # conv
-                        ConvLayerMemoryManager.attach(
-                            child_module, module._memory_manager
-                        )
-                        # attach to ARA as well
-                        if hasattr(child_module, "ara_lora_ref"):
-                            ara = child_module.ara_lora_ref()
-                            if ara not in modules_processed:
-                                MemoryManager.attach(
-                                    ara, 
-                                    device,
-                                )
+                                ) 
                             modules_processed.append(ara)
                     modules_processed.append(child_module)
                 elif child_module.__class__.__name__ in UNMANAGED_MODULES or any(
@@ -149,5 +146,6 @@ class MemoryManager:
                 ):
                     # unmanaged
                     module._memory_manager.unmanaged_modules.append(child_module)
+                    modules_processed.append(child_module) # Avoid redundant processing
                 else:
                     continue
