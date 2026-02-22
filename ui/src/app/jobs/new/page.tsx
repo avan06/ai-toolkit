@@ -88,6 +88,11 @@ export default function TrainingForm() {
     const datasetOptions = datasets.map(name => ({ value: path.join(settings.DATASETS_FOLDER, name), label: name }));
     setDatasetOptions(datasetOptions);
 
+    // Skip auto-assigning default dataset if we are editing or cloning an existing job
+    if (runId || cloneId) return;
+
+    const defaultDatasetPath = defaultDatasetConfig.folder_path;
+
     if (datasetOptions.length > 0) {
       const defaultDatasetPath = defaultDatasetConfig.folder_path;
       // Use functional updater so we check the *current* state, not a stale closure
@@ -101,7 +106,7 @@ export default function TrainingForm() {
         return updated;
       });
     }
-  }, [datasets, settings, isSettingsLoaded, datasetFetchStatus]);
+  }, [datasets, settings, isSettingsLoaded, datasetFetchStatus, runId, cloneId]); // Added runId and cloneId to deps
 
   // clone existing job
   useEffect(() => {
@@ -144,9 +149,12 @@ export default function TrainingForm() {
 
   useEffect(() => {
     if (isSettingsLoaded) {
-      setJobConfig(settings.TRAINING_FOLDER, 'config.process[0].training_folder');
+      // Only set default training folder if it's a completely new job
+      if (!runId && !cloneId) {
+        setJobConfig(settings.TRAINING_FOLDER, 'config.process[0].training_folder');
+      }
     }
-  }, [settings, isSettingsLoaded]);
+  }, [settings, isSettingsLoaded, runId, cloneId]); // Added runId and cloneId to deps
 
   const saveJob = async () => {
     if (status === 'saving') return;
