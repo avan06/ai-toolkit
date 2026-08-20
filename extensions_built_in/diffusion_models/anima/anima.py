@@ -2,6 +2,7 @@ import os
 from typing import List, Optional
 
 import torch
+import torch.nn.functional as F
 import yaml
 from optimum.quanto import freeze
 from safetensors.torch import load_file, save_file
@@ -466,6 +467,62 @@ class AnimaModel(BaseModel):
                 pipeline.vae.to("cpu")
                 flush()
 
+    def _condition_with_reference_image(
+        self,
+        latents: torch.Tensor,
+        batch,
+        require_control: bool = False,
+    ):
+        control_tensor = getattr(batch, "control_tensor", None)
+        if control_tensor is None:
+            if require_control:
+                raise ValueError(
+                    "Anima Edit requires a Control Dataset. Set datasets[].control_path "
+                    "to source images whose filenames match the Target Dataset."
+                )
+            return latents
+
+        if control_tensor.ndim != 4:
+            raise ValueError(
+                "Anima Edit currently supports one control image per target. "
+                f"Expected [B, C, H, W], got {tuple(control_tensor.shape)}."
+            )
+
+        with torch.no_grad():
+            # AI Toolkit control images use [0, 1]; the Anima VAE expects [-1, 1].
+            control_tensor = (control_tensor * 2.0 - 1.0).to(
+                self.vae_device_torch, dtype=self.vae_torch_dtype
+            )
+
+            if batch.tensor is not None:
+                target_h, target_w = batch.tensor.shape[-2:]
+            else:
+                # Cached target latents do not keep batch.tensor. The paired control
+                # image must still use the same crop dimensions as the target item.
+                target_h = batch.file_items[0].crop_height
+                target_w = batch.file_items[0].crop_width
+
+            if control_tensor.shape[-2:] != (target_h, target_w):
+                control_tensor = F.interpolate(
+                    control_tensor,
+                    size=(target_h, target_w),
+                    mode="bilinear",
+                    align_corners=False,
+                )
+
+            control_latents = self.encode_images(control_tensor).to(
+                latents.device, latents.dtype
+            )
+
+        # Cosmos/Anima treats the target and reference as temporal frames.
+        target_latents = latents.unsqueeze(2)
+        reference_latents = control_latents.unsqueeze(2)
+        return torch.cat([target_latents, reference_latents], dim=2).detach()
+
+    def condition_noisy_latents(self, latents: torch.Tensor, batch):
+        # Preserve the original text-to-image path when no control dataset exists.
+        return self._condition_with_reference_image(latents, batch, require_control=False)
+
     def get_noise_prediction(
         self,
         latent_model_input: torch.Tensor,
@@ -476,7 +533,16 @@ class AnimaModel(BaseModel):
         if self.trainable_model.transformer.device != self.device_torch:
             self.trainable_model.transformer.to(self.device_torch)
 
-        latent_model_input = latent_model_input.unsqueeze(2).to(self.device_torch, dtype=self.torch_dtype)
+        if latent_model_input.ndim == 4:
+            # Original Anima text-to-image training path.
+            latent_model_input = latent_model_input.unsqueeze(2)
+        elif latent_model_input.ndim != 5:
+            raise ValueError(
+                "Anima expects 4D text-to-image latents or 5D edit latents, "
+                f"got {tuple(latent_model_input.shape)}."
+            )
+
+        latent_model_input = latent_model_input.to(self.device_torch, dtype=self.torch_dtype)
         timestep = (timestep / self.noise_scheduler.config.num_train_timesteps).to(self.device_torch, self.torch_dtype)
         prompt_embeds = self._condition_prompt_embeds(text_embeddings, dtype=self.torch_dtype)
         padding_mask = latent_model_input.new_zeros(
@@ -495,6 +561,9 @@ class AnimaModel(BaseModel):
             return_dict=False,
         )[0]
 
+        # Reference frames are conditioning only. Keep the target frame so the
+        # existing flow-matching target and loss remain unchanged.
+        noise_pred = noise_pred[:, :, :1, :, :]
         return noise_pred.squeeze(2)
 
     @staticmethod
@@ -671,3 +740,12 @@ class AnimaModel(BaseModel):
 
             state_dict = _convert_non_diffusers_anima_lora_to_diffusers(state_dict)
         return {self._add_ai_toolkit_wrapper_prefix(key): value for key, value in state_dict.items()}
+
+
+class AnimaEditModel(AnimaModel):
+    """Anima paired-image edit training using AI Toolkit control datasets."""
+
+    arch = "anima_edit"
+
+    def condition_noisy_latents(self, latents: torch.Tensor, batch):
+        return self._condition_with_reference_image(latents, batch, require_control=True)

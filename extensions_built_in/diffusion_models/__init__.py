@@ -13,7 +13,7 @@ from .ernie_image import ErnieImageModel
 from .nucleus_image import NucleusImageModel
 from .hidream.hidream_o1_model import HidreamO1Model
 from .z_image.z_image_l2p_model import ZImageL2PModel
-from .anima import AnimaModel
+from .anima import AnimaEditModel, AnimaModel
 from .ideogram4 import Ideogram4Model
 from .prx_pixel_t2i import PRXPixelT2IModel
 from .krea2 import Krea2Model
@@ -49,6 +49,7 @@ AI_TOOLKIT_MODELS = [
     HidreamO1Model,
     ZImageL2PModel,
     AnimaModel,
+    AnimaEditModel,
     Ideogram4Model,
     PRXPixelT2IModel,
     Krea2Model,

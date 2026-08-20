@@ -102,6 +102,32 @@ export const modelArchs: ModelArch[] = [
     additionalSections: ['model.low_vram', 'model.layer_offloading'],
   },
   {
+    name: 'anima_edit',
+    label: 'Anima Edit',
+    group: 'instruction',
+    defaults: {
+      'config.process[0].model.name_or_path': [
+        'circlestone-labs/Anima-Base-v1.0-Diffusers',
+        defaultNameOrPath,
+      ],
+      'config.process[0].model.quantize': [false, false],
+      'config.process[0].model.quantize_te': [false, false],
+      'config.process[0].model.qtype': ['', 'qfloat8'],
+      'config.process[0].model.qtype_te': ['', 'qfloat8'],
+      'config.process[0].sample.sampler': ['flowmatch', 'flowmatch'],
+      'config.process[0].train.noise_scheduler': ['flowmatch', 'flowmatch'],
+      'config.process[0].train.timestep_type': ['weighted', 'sigmoid'],
+    },
+    disableSections: ['network.conv'],
+    additionalSections: ['datasets.control_path', 'model.low_vram', 'model.layer_offloading'],
+    modelNotes: (
+      <>
+        Uses paired Target and Control datasets. Control filenames must match the target filenames. Disable sampling
+        while training; edit sampling is currently intended for ComfyUI-Cosmos-Reference.
+      </>
+    ),
+  },
+  {
     name: 'flux',
     label: 'FLUX.1',
     group: 'image',

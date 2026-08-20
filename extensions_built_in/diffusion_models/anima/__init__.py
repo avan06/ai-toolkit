@@ -1,1 +1,1 @@
-from .anima import AnimaModel, AnimaPromptEmbeds
+from .anima import AnimaEditModel, AnimaModel, AnimaPromptEmbeds
